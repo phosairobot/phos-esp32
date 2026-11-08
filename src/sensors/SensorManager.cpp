@@ -12,12 +12,25 @@
 #define PHOS_IMU_DIAGNOSTICS 0
 #endif
 
+#ifndef PHOS_CONTROLLER_DIAGNOSTICS
+#define PHOS_CONTROLLER_DIAGNOSTICS 0
+#endif
+
+#ifndef PHOS_MPU_DISABLE_MOTION_REPORTING
+#define PHOS_MPU_DISABLE_MOTION_REPORTING 0
+#endif
+
 void SensorManager::begin() {
   Wire.begin(HardwareConfig::I2C_SDA_PIN, HardwareConfig::I2C_SCL_PIN);
   Wire.setTimeOut(HardwareConfig::I2C_TIMEOUT_MS);
   bmpOk_ = bmp_.begin(HardwareConfig::BMP280_I2C_ADDRESS) || bmp_.begin(0x77);
   ccsOk_ = ccs_.begin(HardwareConfig::CCS811_I2C_ADDRESS) || ccs_.begin(0x5B);
-  mpuOk_ = mpu_.begin(HardwareConfig::MPU6050_I2C_ADDRESS) || mpu_.begin(0x69);
+  mpuOk_ = mpu_.begin(HardwareConfig::MPU6050_I2C_ADDRESS);
+  if (mpuOk_) mpuAddress_ = HardwareConfig::MPU6050_I2C_ADDRESS;
+  else {
+    mpuOk_ = mpu_.begin(0x69);
+    if (mpuOk_) mpuAddress_ = 0x69;
+  }
 }
 
 void SensorManager::update(uint32_t now, SensorReporter& reporter) {
@@ -83,8 +96,29 @@ void SensorManager::updateImu(uint32_t now, SensorReporter& reporter) {
   if (!mpuOk_ || now - lastImuSampleAt_ < ReportingConfig::IMU_SAMPLE_INTERVAL_MS) return;
   lastImuSampleAt_ = now;
   ++diagnostics_.imuSamples;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  // Adafruit_MPU6050::getEvent() does not expose Wire status. Probe the same
+  // address first and time both operations so an I2C fault is observable
+  // without changing motion thresholds or normal reporting.
+  const uint32_t probeStartedAt = micros();
+  Wire.beginTransmission(mpuAddress_);
+  const uint8_t i2cStatus = Wire.endTransmission(true);
+  const uint32_t probeElapsedUs = micros() - probeStartedAt;
+  if (i2cStatus != 0) ++diagnostics_.imuI2cErrors;
+  if (probeElapsedUs >= static_cast<uint32_t>(HardwareConfig::I2C_TIMEOUT_MS) * 1000UL)
+    ++diagnostics_.imuI2cTimeouts;
+  if (i2cStatus != 0) return;
+  const uint32_t readStartedAt = micros();
+#endif
   sensors_event_t acceleration, gyro, temperature;
   mpu_.getEvent(&acceleration, &gyro, &temperature);
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  const uint32_t readElapsedUs = micros() - readStartedAt;
+  if (readElapsedUs >= static_cast<uint32_t>(HardwareConfig::I2C_TIMEOUT_MS) * 1000UL)
+    ++diagnostics_.imuI2cTimeouts;
+  else if (readElapsedUs >= ReportingConfig::IMU_SAMPLE_INTERVAL_MS * 1000UL)
+    ++diagnostics_.imuSlowReads;
+#endif
   accelerationX_ = acceleration.acceleration.x;
   accelerationY_ = acceleration.acceleration.y;
   accelerationZ_ = acceleration.acceleration.z;
@@ -196,9 +230,25 @@ const char* SensorManager::motionIntensity() const {
 
 void SensorManager::reportMotion(SensorReporter& reporter, const char* state, const char* intensity) {
   if (!hasMotionState_ || strcmp(state, reportedMotionState_) || strcmp(intensity, reportedMotionIntensity_)) {
+#if PHOS_CONTROLLER_DIAGNOSTICS
+    ++diagnostics_.motionEventsGenerated;
+#endif
+#if PHOS_MPU_DISABLE_MOTION_REPORTING
+    // Keep MPU sampling and state calculation active while isolating serial
+    // traffic. State is still latched to avoid counting the same event at 50Hz.
+    reportedMotionState_ = state; reportedMotionIntensity_ = intensity; hasMotionState_ = true;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+    ++diagnostics_.motionEventsDisabled;
+#endif
+    return;
+#else
     if (reporter.motionUpdate(state, intensity)) {
       reportedMotionState_ = state; reportedMotionIntensity_ = intensity; hasMotionState_ = true;
       ++diagnostics_.updatesTransmitted;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      ++diagnostics_.motionEventsTransmitted;
+#endif
     } else ++diagnostics_.transmissionFailures;
+#endif
   }
 }

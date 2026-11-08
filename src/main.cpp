@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <esp_system.h>
 #include <string.h>
 
 #include "config/HardwareConfig.h"
@@ -8,6 +9,10 @@
 #include "sensors/SensorManager.h"
 
 namespace {
+#ifndef PHOS_CONTROLLER_DIAGNOSTICS
+#define PHOS_CONTROLLER_DIAGNOSTICS 0
+#endif
+
 constexpr char PROTOCOL[] = "phos-hw";
 constexpr uint8_t VERSION = 1;
 LedOutput leds;
@@ -23,13 +28,27 @@ char txQueue[HardwareConfig::SERIAL_TX_QUEUE_BYTES];
 char txEncodeBuffer[HardwareConfig::MAX_FRAME_BYTES + 1];
 size_t txHead = 0, txTail = 0, txCount = 0;
 uint32_t lastTxProgressAt = 0;
+uint32_t loopIterations = 0;
+uint32_t txFramesQueued = 0;
+uint32_t txQueueFullDrops = 0;
+uint32_t txStallDrops = 0;
+uint32_t txBytesWritten = 0;
+
+#if PHOS_CONTROLLER_DIAGNOSTICS
+RTC_DATA_ATTR uint32_t diagnosticBootId = 0;
+esp_reset_reason_t diagnosticResetReason;
+#endif
 
 bool queueTx(const char* data, size_t length) {
-  if (length > HardwareConfig::SERIAL_TX_QUEUE_BYTES - txCount) return false;
+  if (length > HardwareConfig::SERIAL_TX_QUEUE_BYTES - txCount) {
+    ++txQueueFullDrops;
+    return false;
+  }
   for (size_t i = 0; i < length; ++i) txQueue[(txHead + i) % HardwareConfig::SERIAL_TX_QUEUE_BYTES] = data[i];
   txHead = (txHead + length) % HardwareConfig::SERIAL_TX_QUEUE_BYTES;
   txCount += length;
   if (txCount == length) lastTxProgressAt = millis();
+  ++txFramesQueued;
   return true;
 }
 
@@ -39,6 +58,7 @@ void serviceTx(uint32_t now) {
     // Stale telemetry must not prevent replies after a host restart. Frames
     // are discarded only after no serial-progress for the bounded interval.
     txHead = txTail = txCount = 0;
+    ++txStallDrops;
     return;
   }
   const int writable = Serial.availableForWrite();
@@ -48,6 +68,7 @@ void serviceTx(uint32_t now) {
   if (!written) return;
   txTail = (txTail + written) % HardwareConfig::SERIAL_TX_QUEUE_BYTES;
   txCount -= written;
+  txBytesWritten += written;
   lastTxProgressAt = now;
 }
 
@@ -87,6 +108,31 @@ class Reporter : public SensorReporter {
     return send("orientation_update", p);
   }
 } reporter;
+
+void controllerStatus(JsonDocument& payload) {
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  JsonObject status = payload["controller_status"].to<JsonObject>();
+  const SensorManager::Diagnostics sensorStatus = sensors.diagnostics();
+  status["boot_id"] = diagnosticBootId;
+  status["reset_reason"] = static_cast<uint32_t>(diagnosticResetReason);
+  status["uptime_ms"] = millis();
+  status["loop_iterations"] = loopIterations;
+  status["tx_frames_queued"] = txFramesQueued;
+  status["tx_queue_full_drops"] = txQueueFullDrops;
+  status["tx_stall_drops"] = txStallDrops;
+  status["tx_bytes_written"] = txBytesWritten;
+  status["imu_samples"] = sensorStatus.imuSamples;
+  status["imu_i2c_errors"] = sensorStatus.imuI2cErrors;
+  status["imu_i2c_timeouts"] = sensorStatus.imuI2cTimeouts;
+  status["imu_slow_reads"] = sensorStatus.imuSlowReads;
+  status["motion_events_generated"] = sensorStatus.motionEventsGenerated;
+  status["motion_events_transmitted"] = sensorStatus.motionEventsTransmitted;
+  status["motion_events_disabled"] = sensorStatus.motionEventsDisabled;
+  status["sensor_tx_failures"] = sensorStatus.transmissionFailures;
+#else
+  (void)payload;
+#endif
+}
 
 void capabilities() {
   JsonDocument p; JsonArray list = p["capabilities"].to<JsonArray>();
@@ -147,12 +193,19 @@ void serialPoll() {
 
 void setup() {
   Serial.begin(HardwareConfig::SERIAL_BAUD);
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  ++diagnosticBootId;
+  diagnosticResetReason = esp_reset_reason();
+#endif
   leds.begin(); sensors.begin();
-  JsonDocument hello; hello["controller"] = "esp32"; send("hello", hello);
+  JsonDocument hello; hello["controller"] = "esp32"; controllerStatus(hello); send("hello", hello);
 }
 
 void loop() {
+  ++loopIterations;
   const uint32_t now = millis();
   serviceTx(now); serialPoll(); leds.update(now); sensors.update(now, reporter); serviceTx(millis());
-  if (now - lastHeartbeat >= ReportingConfig::HEARTBEAT_INTERVAL_MS) { JsonDocument p; send("heartbeat", p); lastHeartbeat = now; }
+  if (now - lastHeartbeat >= ReportingConfig::HEARTBEAT_INTERVAL_MS) {
+    JsonDocument p; controllerStatus(p); send("heartbeat", p); lastHeartbeat = now;
+  }
 }

@@ -229,6 +229,8 @@
                 "PHOS_LED_STANDALONE_BRIGHTNESS=40",
                 "PHOS_LED_MAX_BRIGHTNESS=0.25F",
                 "PHOS_LED_DEFAULT_BRIGHTNESS=0.15F",
+                "PHOS_CONTROLLER_DIAGNOSTICS=0",
+                "PHOS_MPU_DISABLE_MOTION_REPORTING=0",
                 "ESP32",
                 "ESP_PLATFORM",
                 "F_CPU=240000000L",

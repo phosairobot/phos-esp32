@@ -22,6 +22,12 @@ class SensorManager {
     uint32_t updatesSuppressed = 0;
     uint32_t updatesRefreshed = 0;
     uint32_t transmissionFailures = 0;
+    uint32_t motionEventsGenerated = 0;
+    uint32_t motionEventsTransmitted = 0;
+    uint32_t motionEventsDisabled = 0;
+    uint32_t imuI2cErrors = 0;
+    uint32_t imuI2cTimeouts = 0;
+    uint32_t imuSlowReads = 0;
   };
   void begin();
   void update(uint32_t now, SensorReporter& reporter);
@@ -34,6 +40,7 @@ class SensorManager {
   Adafruit_CCS811 ccs_;
   Adafruit_MPU6050 mpu_;
   bool bmpOk_ = false, ccsOk_ = false, mpuOk_ = false;
+  uint8_t mpuAddress_ = 0;
   bool hasTemperature_ = false, hasPressure_ = false, hasEco2_ = false, hasTvoc_ = false;
   bool temperatureValid_ = false, pressureValid_ = false, eco2Valid_ = false, tvocValid_ = false;
   bool hasMotionState_ = false, gravityInitialized_ = false, moving_ = false;
