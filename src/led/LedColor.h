@@ -27,4 +27,11 @@ inline uint8_t brightnessByte(float brightness) {
   return static_cast<uint8_t>(brightness * 255.0F + 0.5F);
 }
 
+// Keep the requested protocol value separate from the brightness actually
+// rendered on the LEDs. Both operands are bounded so a malformed build flag
+// cannot increase output above full scale.
+inline float cappedBrightness(float requested, float maximum) {
+  return constrain(constrain(requested, 0.0F, 1.0F), 0.0F, constrain(maximum, 0.0F, 1.0F));
+}
+
 }  // namespace LedColor

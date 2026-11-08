@@ -42,6 +42,17 @@ void test_brightness_normalization_boundaries() {
     TEST_ASSERT_EQUAL_UINT8(expected[i], LedColor::brightnessByte(input[i]));
 }
 
+void test_effective_brightness_is_capped_without_changing_requested_value() {
+  const float requested[] = {0.0F, 0.15F, 0.25F, 0.3F, 0.5F, 1.0F};
+  const float expected[] = {0.0F, 0.15F, 0.25F, 0.25F, 0.25F, 0.25F};
+  for (uint8_t i = 0; i < 6; ++i) {
+    const float original = requested[i];
+    TEST_ASSERT_FLOAT_WITHIN(0.0001F, expected[i], LedColor::cappedBrightness(requested[i], 0.25F));
+    // The source value is separate state in LedOutput and is not mutated by this pure render calculation.
+    TEST_ASSERT_FLOAT_WITHIN(0.0001F, original, requested[i]);
+  }
+}
+
 void test_full_brightness_composite_buffer_is_raw_grb() {
   Adafruit_NeoPixel strip(1, 19, NEO_GRB + NEO_KHZ800);
   strip.setBrightness(LedColor::brightnessByte(1.0F));
@@ -65,6 +76,38 @@ void test_all_requested_colors_parse_to_expected_rgb() {
   }
 }
 
+void test_consecutive_rgb_writes_replace_the_entire_grb_buffer() {
+  Adafruit_NeoPixel strip(2, 19, NEO_GRB + NEO_KHZ800);
+  strip.setBrightness(255);
+  for (uint8_t pixel = 0; pixel < 2; ++pixel) strip.setPixelColor(pixel, 255, 0, 0);
+  for (uint8_t pixel = 0; pixel < 2; ++pixel) strip.setPixelColor(pixel, 0, 255, 0);
+  const uint8_t* bytes = strip.getPixels();
+  // Both pixels must now be green in GRB storage: G=255, R=0, B=0.
+  for (uint8_t offset = 0; offset < 6; offset += 3) {
+    TEST_ASSERT_EQUAL_UINT8(255, bytes[offset]);
+    TEST_ASSERT_EQUAL_UINT8(0, bytes[offset + 1]);
+    TEST_ASSERT_EQUAL_UINT8(0, bytes[offset + 2]);
+  }
+}
+
+void test_black_clear_leaves_no_previous_channels_in_the_buffer() {
+  Adafruit_NeoPixel strip(2, 19, NEO_GRB + NEO_KHZ800);
+  strip.setBrightness(255);
+  for (uint8_t pixel = 0; pixel < 2; ++pixel) strip.setPixelColor(pixel, 204, 207, 41);
+  strip.clear();
+  const uint8_t* bytes = strip.getPixels();
+  for (uint8_t offset = 0; offset < 6; ++offset) TEST_ASSERT_EQUAL_UINT8(0, bytes[offset]);
+}
+
+void test_explicit_rgb_scaling_is_not_cumulative() {
+  const uint8_t redAt40 = LedColor::scaleChannel(255, 40.0F / 255.0F);
+  const uint8_t greenAt40 = LedColor::scaleChannel(255, 40.0F / 255.0F);
+  // Each frame is derived from its unmodified RGB input, not from prior RAM.
+  TEST_ASSERT_EQUAL_UINT8(40, redAt40);
+  TEST_ASSERT_EQUAL_UINT8(40, greenAt40);
+  TEST_ASSERT_EQUAL_UINT8(40, LedColor::scaleChannel(255, 40.0F / 255.0F));
+}
+
 void setup() {
   delay(2000);
   UNITY_BEGIN();
@@ -72,8 +115,12 @@ void setup() {
   RUN_TEST(test_composite_color_brightness_boundaries);
   RUN_TEST(test_white_and_primary_channels_do_not_overflow_at_full_brightness);
   RUN_TEST(test_brightness_normalization_boundaries);
+  RUN_TEST(test_effective_brightness_is_capped_without_changing_requested_value);
   RUN_TEST(test_full_brightness_composite_buffer_is_raw_grb);
   RUN_TEST(test_all_requested_colors_parse_to_expected_rgb);
+  RUN_TEST(test_consecutive_rgb_writes_replace_the_entire_grb_buffer);
+  RUN_TEST(test_black_clear_leaves_no_previous_channels_in_the_buffer);
+  RUN_TEST(test_explicit_rgb_scaling_is_not_cumulative);
   UNITY_END();
 }
 

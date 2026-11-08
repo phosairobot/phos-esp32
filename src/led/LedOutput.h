@@ -5,6 +5,10 @@
 
 #include "../config/HardwareConfig.h"
 
+#ifndef PHOS_LED_DEFAULT_BRIGHTNESS
+#define PHOS_LED_DEFAULT_BRIGHTNESS 0.15F
+#endif
+
 class LedOutput {
  public:
   void begin();
@@ -26,7 +30,8 @@ class LedOutput {
   uint32_t durationMs_ = 0;
   float minIntensity_ = 0.0F;
   float maxIntensity_ = 1.0F;
-  float brightness_ = static_cast<float>(HardwareConfig::LED_DEFAULT_BRIGHTNESS) / 255.0F;
+  // Requested protocol brightness; it is capped only when rendering.
+  float brightness_ = PHOS_LED_DEFAULT_BRIGHTNESS;
   bool initialized_ = false;
   bool outputIsClear_ = true;
   bool frameDirty_ = false;
@@ -38,9 +43,11 @@ class LedOutput {
   uint16_t physicalIndex(uint16_t logicalIndex) const;
   uint16_t originIndex() const;
   uint16_t circularIndex(uint16_t progress) const;
+  float effectiveBrightness(float intensity = 1.0F) const;
   void setLogicalPixel(uint16_t logicalIndex, uint32_t color);
   void showCircularWipe(uint16_t progress);
   void showSymmetricChase(uint16_t progress);
   void showSymmetricWipe(uint16_t progress);
   void showSolid(uint32_t color, float intensity = 1.0F);
+  void showRawSolid(uint32_t color);
 };

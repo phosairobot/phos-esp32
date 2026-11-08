@@ -6,15 +6,37 @@
 #include <math.h>
 #include <string.h>
 
+#ifndef PHOS_LED_STANDALONE_SOLID_AB
+#define PHOS_LED_STANDALONE_SOLID_AB 0
+#endif
+
+#ifndef PHOS_LED_STANDALONE_BRIGHTNESS
+#define PHOS_LED_STANDALONE_BRIGHTNESS 40
+#endif
+
+#ifndef PHOS_LED_MAX_BRIGHTNESS
+#define PHOS_LED_MAX_BRIGHTNESS 0.25F
+#endif
+
+#ifndef PHOS_LED_DEFAULT_BRIGHTNESS
+#define PHOS_LED_DEFAULT_BRIGHTNESS 0.15F
+#endif
+
 void LedOutput::begin() {
   pinMode(HardwareConfig::LED_PIN, OUTPUT);
   digitalWrite(HardwareConfig::LED_PIN, LOW);
   delay(10);
   pixels_.begin();
-  // Keep NeoPixel's destructive global brightness scaler disabled.  In
-  // particular it stores 255 as an internal zero sentinel; RGB scaling is
-  // performed explicitly while rendering each frame below.
+  // Normal firmware rendering always keeps RGB input and brightness separate;
+  // NeoPixel's setter rescales its existing RAM and is therefore not used
+  // after initialization. The optional A/B mode deliberately matches the
+  // standalone sketch for solid commands.
+#if PHOS_LED_STANDALONE_SOLID_AB
+  pixels_.setBrightness(PHOS_LED_STANDALONE_BRIGHTNESS);
+  brightness_ = static_cast<float>(PHOS_LED_STANDALONE_BRIGHTNESS) / 255.0F;
+#else
   pixels_.setBrightness(255);
+#endif
   initialized_ = true;
   outputIsClear_ = false;
   clear();
@@ -30,12 +52,15 @@ void LedOutput::clear() {
 
 bool LedOutput::setBrightness(float brightness) {
   if (!initialized_ || !std::isfinite(brightness)) return false;
+#if PHOS_LED_STANDALONE_SOLID_AB
+  // The A/B experiment intentionally holds solid output at the standalone
+  // test level while JSON parsing and ACK handling remain unchanged.
+  if (animation_ == "solid") brightness_ = static_cast<float>(PHOS_LED_STANDALONE_BRIGHTNESS) / 255.0F;
+  else brightness_ = constrain(brightness, 0.0F, 1.0F);
+#else
   brightness = constrain(brightness, 0.0F, 1.0F);
   brightness_ = brightness;
-  // Adafruit NeoPixel rescales its existing RAM buffer when global
-  // brightness changes.  The subsequent update redraws from color_, so no
-  // lossy scaled pixels survive. Dynamic effects instead retain a raw buffer.
-  pixels_.setBrightness(animation_ == "solid" ? LedColor::brightnessByte(brightness_) : 255);
+#endif
   frameDirty_ = true;
   update(millis());
   return true;
@@ -157,9 +182,10 @@ uint16_t LedOutput::circularIndex(uint16_t progress) const {
 }
 
 void LedOutput::setLogicalPixel(uint16_t logicalIndex, uint32_t color) {
-  const uint8_t red = LedColor::scaleChannel((color >> 16) & 0xFF, brightness_);
-  const uint8_t green = LedColor::scaleChannel((color >> 8) & 0xFF, brightness_);
-  const uint8_t blue = LedColor::scaleChannel(color & 0xFF, brightness_);
+  const float brightness = effectiveBrightness();
+  const uint8_t red = LedColor::scaleChannel((color >> 16) & 0xFF, brightness);
+  const uint8_t green = LedColor::scaleChannel((color >> 8) & 0xFF, brightness);
+  const uint8_t blue = LedColor::scaleChannel(color & 0xFF, brightness);
   pixels_.setPixelColor(physicalIndex(logicalIndex), red, green, blue);
 }
 
@@ -191,17 +217,30 @@ void LedOutput::showSymmetricWipe(uint16_t progress) {
 }
 
 void LedOutput::showSolid(uint32_t color, float intensity) {
+#if PHOS_LED_STANDALONE_SOLID_AB
+  if (animation_ == "solid") {
+    showRawSolid(color);
+    return;
+  }
+#endif
+  const float combinedIntensity = effectiveBrightness(intensity);
+  const uint8_t red = LedColor::scaleChannel((color >> 16) & 0xFF, combinedIntensity);
+  const uint8_t green = LedColor::scaleChannel((color >> 8) & 0xFF, combinedIntensity);
+  const uint8_t blue = LedColor::scaleChannel(color & 0xFF, combinedIntensity);
+  for (uint16_t i = 0; i < HardwareConfig::LED_COUNT; ++i) pixels_.setPixelColor(i, red, green, blue);
+  pixels_.show();
+  outputIsClear_ = false;
+}
+
+float LedOutput::effectiveBrightness(float intensity) const {
+  return LedColor::cappedBrightness(brightness_, PHOS_LED_MAX_BRIGHTNESS) *
+      constrain(intensity, 0.0F, 1.0F);
+}
+
+void LedOutput::showRawSolid(uint32_t color) {
   uint8_t red = (color >> 16) & 0xFF;
   uint8_t green = (color >> 8) & 0xFF;
   uint8_t blue = color & 0xFF;
-  // solid uses the NeoPixel global scaler. Blink/pulse/breathe run with it
-  // disabled and scale each rendered frame to avoid lossy buffer rescaling.
-  if (animation_ != "solid") {
-    const float combinedIntensity = constrain(brightness_ * intensity, 0.0F, 1.0F);
-    red = LedColor::scaleChannel(red, combinedIntensity);
-    green = LedColor::scaleChannel(green, combinedIntensity);
-    blue = LedColor::scaleChannel(blue, combinedIntensity);
-  }
   for (uint16_t i = 0; i < HardwareConfig::LED_COUNT; ++i) pixels_.setPixelColor(i, red, green, blue);
   pixels_.show();
   outputIsClear_ = false;

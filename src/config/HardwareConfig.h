@@ -12,7 +12,9 @@ constexpr uint8_t MPU6050_I2C_ADDRESS = 0x68;
 
 constexpr uint8_t LED_PIN = 19;
 constexpr uint16_t LED_COUNT = 12;
-constexpr uint8_t LED_DEFAULT_BRIGHTNESS = 32;
+// Legacy board default; LED output now uses PHOS_LED_DEFAULT_BRIGHTNESS from
+// platformio.ini so the requested protocol brightness remains a float.
+constexpr float LED_DEFAULT_BRIGHTNESS = 0.15F;
 // Ring calibration: physical LED 6 is top; incrementing physical indexes move
 // clockwise. Physical validation found LED 0 at the bottom. Animation code
 // uses logical positions only, so these are the only board-specific values to
