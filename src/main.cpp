@@ -98,6 +98,10 @@ class Reporter : public SensorReporter {
   bool sensorUpdate(const char* sensor, float value, const char* unit) override {
     JsonDocument p; p["sensor"] = sensor; p["value"] = value; p["unit"] = unit; return send("sensor_update", p);
   }
+  bool sensorStatus(uint8_t validity, bool compensationActive) override {
+    JsonDocument p; p["sensor"] = "ens160"; p["validity"] = validity;
+    p["compensation_active"] = compensationActive; return send("sensor_status", p);
+  }
   bool motionUpdate(const char* state, const char* intensity) override {
     JsonDocument p; p["state"] = state; p["intensity"] = intensity; return send("motion_update", p);
   }
@@ -129,6 +133,51 @@ void controllerStatus(JsonDocument& payload) {
   status["motion_events_transmitted"] = sensorStatus.motionEventsTransmitted;
   status["motion_events_disabled"] = sensorStatus.motionEventsDisabled;
   status["sensor_tx_failures"] = sensorStatus.transmissionFailures;
+  status["ens160_validity"] = sensorStatus.ensValidity;
+  status["ens160_compensation_active"] = sensorStatus.ensCompensationActive;
+  JsonObject ens = status["ens160"].to<JsonObject>();
+  ens["detected"] = sensorStatus.ensDetected;
+  ens["address"] = sensorStatus.ensAddress;
+  ens["operating_mode"] = sensorStatus.ensOperatingMode;
+  ens["raw_status_read"] = sensorStatus.ensRawStatusRead;
+  ens["raw_status"] = sensorStatus.ensRawStatus;
+  ens["newdat"] = sensorStatus.ensNewdat;
+  ens["new_data"] = sensorStatus.ensNewData;
+  ens["measurement_attempted"] = sensorStatus.ensMeasurementAttempted;
+  ens["validity"] = sensorStatus.ensValidity;
+  ens["measurement_read"] = sensorStatus.ensMeasurementRead;
+  ens["has_raw_measurement"] = sensorStatus.ensHasRawMeasurement;
+  ens["measurement_usable"] = sensorStatus.ensMeasurementUsable;
+  ens["availability_reason"] = sensorStatus.ensAvailabilityReason;
+  if (sensorStatus.ensHasRawMeasurement)
+    ens["ms_since_measurement"] = millis() - sensorStatus.ensLastMeasurementAt;
+  else
+    ens["ms_since_measurement"] = nullptr;
+  if (sensorStatus.ensHasRawMeasurement) {
+    ens["aqi"] = sensorStatus.ensRawAqi;
+    ens["eco2"] = sensorStatus.ensRawEco2;
+    ens["tvoc"] = sensorStatus.ensRawTvoc;
+  } else {
+    ens["aqi"] = nullptr;
+    ens["eco2"] = nullptr;
+    ens["tvoc"] = nullptr;
+  }
+  ens["data_ready_samples"] = sensorStatus.ensDataReadySamples;
+  ens["accepted_samples"] = sensorStatus.ensAcceptedSamples;
+  ens["rejected_no_new_data"] = sensorStatus.ensRejectedNoNewData;
+  ens["rejected_validity"] = sensorStatus.ensRejectedValidity;
+  ens["rejected_aqi"] = sensorStatus.ensRejectedAqi;
+  ens["report_frames"] = sensorStatus.ensReportFrames;
+  ens["last_rejection"] = sensorStatus.ensLastRejection;
+  ens["ms_since_accepted"] = sensorStatus.ensLastAcceptedAt ? millis() - sensorStatus.ensLastAcceptedAt : 0;
+  ens["ms_since_report"] = sensorStatus.ensLastReportAt ? millis() - sensorStatus.ensLastReportAt : 0;
+  ens["aht_humidity_valid"] = sensorStatus.ahtHumidityValid;
+  ens["aht_temperature_valid"] = sensorStatus.ahtTemperatureValid;
+  ens["compensation_attempts"] = sensorStatus.ensCompensationAttempts;
+  ens["compensation_failures"] = sensorStatus.ensCompensationFailures;
+  ens["temp_compensation_write_ok"] = sensorStatus.ensTempCompensationWriteOk;
+  ens["rh_compensation_write_ok"] = sensorStatus.ensRhCompensationWriteOk;
+  ens["ms_since_compensation"] = sensorStatus.ensLastCompensationAt ? millis() - sensorStatus.ensLastCompensationAt : 0;
 #else
   (void)payload;
 #endif
@@ -137,7 +186,8 @@ void controllerStatus(JsonDocument& payload) {
 void capabilities() {
   JsonDocument p; JsonArray list = p["capabilities"].to<JsonArray>();
   if (sensors.bmpAvailable()) { list.add("temperature"); list.add("pressure"); }
-  if (sensors.ccsAvailable()) list.add("air_quality");
+  if (sensors.ensAvailable()) list.add("air_quality");
+  if (sensors.ahtAvailable()) list.add("humidity");
   if (sensors.mpuAvailable()) list.add("motion");
   list.add("led"); p["led"]["count"] = HardwareConfig::LED_COUNT;
   send("capabilities", p);
