@@ -7,7 +7,9 @@ constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 // Names avoid collisions with address macros exported by Adafruit libraries.
 constexpr uint8_t BMP280_I2C_ADDRESS = 0x76;
-constexpr uint8_t CCS811_I2C_ADDRESS = 0x5A;
+constexpr uint8_t ENS160_I2C_ADDRESS = 0x53;
+constexpr uint8_t ENS160_ALTERNATE_I2C_ADDRESS = 0x52;
+constexpr uint8_t AHT21_I2C_ADDRESS = 0x38;
 constexpr uint8_t MPU6050_I2C_ADDRESS = 0x68;
 
 constexpr uint8_t LED_PIN = 19;

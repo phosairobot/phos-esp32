@@ -4,6 +4,7 @@
 #include "../config/ReportingConfig.h"
 
 #include <Wire.h>
+#include <ScioSense_ENS16x.h>
 #include <cmath>
 #include <math.h>
 #include <string.h>
@@ -20,11 +21,39 @@
 #define PHOS_MPU_DISABLE_MOTION_REPORTING 0
 #endif
 
+namespace {
+ENS160 primaryEns160;
+ENS160 alternateEns160;
+}
+
 void SensorManager::begin() {
   Wire.begin(HardwareConfig::I2C_SDA_PIN, HardwareConfig::I2C_SCL_PIN);
   Wire.setTimeOut(HardwareConfig::I2C_TIMEOUT_MS);
   bmpOk_ = bmp_.begin(HardwareConfig::BMP280_I2C_ADDRESS) || bmp_.begin(0x77);
-  ccsOk_ = ccs_.begin(HardwareConfig::CCS811_I2C_ADDRESS) || ccs_.begin(0x5B);
+  ensPrimary_ = &primaryEns160;
+  ensPrimary_->begin(&Wire, HardwareConfig::ENS160_I2C_ADDRESS);
+  if (ensPrimary_->init()) {
+    ens_ = ensPrimary_;
+    ensAddress_ = HardwareConfig::ENS160_I2C_ADDRESS;
+  } else {
+    ensAlternate_ = &alternateEns160;
+    ensAlternate_->begin(&Wire, HardwareConfig::ENS160_ALTERNATE_I2C_ADDRESS);
+    if (ensAlternate_->init()) {
+      ens_ = ensAlternate_;
+      ensAddress_ = HardwareConfig::ENS160_ALTERNATE_I2C_ADDRESS;
+    }
+  }
+  ensOk_ = ens_ && ens_->startStandardMeasure() == RESULT_OK;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  diagnostics_.ensDetected = ensOk_;
+  diagnostics_.ensAddress = ensOk_ ? ensAddress_ : 0;
+  if (ensOk_) {
+    uint8_t operatingMode = 0;
+    if (readEnsRegister(ENS16X_REGISTER_ADDRESS_OPMODE, operatingMode))
+      diagnostics_.ensOperatingMode = static_cast<int8_t>(operatingMode);
+  }
+#endif
+  ahtOk_ = aht_.begin(&Wire, 0, HardwareConfig::AHT21_I2C_ADDRESS);
   mpuOk_ = mpu_.begin(HardwareConfig::MPU6050_I2C_ADDRESS);
   if (mpuOk_) mpuAddress_ = HardwareConfig::MPU6050_I2C_ADDRESS;
   else {
@@ -43,11 +72,103 @@ void SensorManager::update(uint32_t now, SensorReporter& reporter) {
       pressureValid_ = std::isfinite(pressure_);
     }
     ++diagnostics_.environmentalSamples;
-    if (ccsOk_ && ccs_.available() && ccs_.readData() == 0) {
-      eco2_ = ccs_.geteCO2();
-      tvoc_ = ccs_.getTVOC();
-      eco2Valid_ = true; tvocValid_ = true;
-    } else if (ccsOk_) eco2Valid_ = tvocValid_ = false;
+    if (ahtOk_) {
+      sensors_event_t humidityEvent, temperatureEvent;
+      aht_.getEvent(&humidityEvent, &temperatureEvent);
+      humidity_ = humidityEvent.relative_humidity;
+      ahtTemperature_ = temperatureEvent.temperature;
+      humidityValid_ = std::isfinite(humidity_) && humidity_ >= 0 && humidity_ <= 100;
+      ahtTemperatureValid_ = std::isfinite(ahtTemperature_);
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      diagnostics_.ahtHumidityValid = humidityValid_;
+      diagnostics_.ahtTemperatureValid = ahtTemperatureValid_;
+#endif
+    }
+    // This is the proven reference path. update() is a single status read;
+    // it additionally reads DATA_x for NEWDAT and GPR_READ for NEWGPR, with
+    // no internal wait. Its cached status avoids a competing DATA_STATUS read.
+    const Result ensUpdate = ensOk_ ? ens_->update() : RESULT_IO_ERROR;
+    const uint8_t ensStatus = ensOk_ ? ens_->getDeviceStatus() : 0;
+    const bool ensStatusRead = ensOk_ && ensUpdate != RESULT_IO_ERROR;
+    ensValidity_ = ensStatusRead ? ((ensStatus >> 2) & 0x03) : 3;
+    diagnostics_.ensValidity = ensValidity_;
+    const bool ensNewData = ensOk_ && ens_->hasNewData();
+    bool compensationWritten = false;
+    if (ensUpdate == RESULT_OK && humidityValid_ && ahtTemperatureValid_) {
+      const uint16_t temperature = static_cast<uint16_t>((ahtTemperature_ + 273.15F) * 64.0F);
+      const uint16_t humidity = static_cast<uint16_t>(humidity_ * 512.0F);
+      compensationWritten = ens_->writeCompensation(temperature, humidity) == RESULT_OK;
+    }
+    diagnostics_.ensCompensationActive = compensationWritten;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+    readEnsDiagnostics(now);
+    diagnostics_.ensNewData = ensNewData;
+    diagnostics_.ensMeasurementAttempted = ensOk_;
+    diagnostics_.ensMeasurementRead = ensNewData;
+    diagnostics_.ensMeasurementUsable = false;
+    if (ensUpdate == RESULT_OK && humidityValid_ && ahtTemperatureValid_) {
+      ++diagnostics_.ensCompensationAttempts;
+      diagnostics_.ensTempCompensationWriteOk = compensationWritten;
+      diagnostics_.ensRhCompensationWriteOk = compensationWritten;
+      diagnostics_.ensLastCompensationAt = now;
+      if (!compensationWritten) ++diagnostics_.ensCompensationFailures;
+    }
+#endif
+    if (ensNewData) {
+      // ENS160 DATA_STATUS validity is bits 3:2: 0 normal, 1 warm-up,
+      // 2 initial start-up, 3 no valid output.
+      aqi_ = static_cast<uint8_t>(ens_->getAirQualityIndex_UBA());
+      eco2_ = ens_->getEco2();
+      tvoc_ = ens_->getTvoc();
+      // An acquired sample is telemetry even while ENS160 is warming up.
+      // sensor_status supplies its contemporaneous validity; the Pi records
+      // such values but cannot use them for environmental decisions.
+      eco2SamplePending_ = true;
+      tvocSamplePending_ = true;
+      aqiSamplePending_ = aqi_ >= 1 && aqi_ <= 5;
+      aqiValid_ = ensValidity_ == 0 && aqi_ >= 1 && aqi_ <= 5;
+      eco2Valid_ = tvocValid_ = aqiValid_;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      ++diagnostics_.ensDataReadySamples;
+      diagnostics_.ensHasRawMeasurement = true;
+      diagnostics_.ensLastMeasurementAt = now;
+      diagnostics_.ensRawAqi = aqi_;
+      diagnostics_.ensRawEco2 = eco2_;
+      diagnostics_.ensRawTvoc = tvoc_;
+      if (ensValidity_ != 0) {
+        ++diagnostics_.ensRejectedValidity;
+        diagnostics_.ensLastRejection = 2;
+        diagnostics_.ensAvailabilityReason = ensValidity_ == 1 ? "warmup" :
+            ensValidity_ == 2 ? "initial_startup" : "invalid_output";
+      } else if (!aqiValid_) {
+        ++diagnostics_.ensRejectedAqi;
+        diagnostics_.ensLastRejection = 3;
+        diagnostics_.ensAvailabilityReason = "aqi_out_of_range";
+      } else {
+        ++diagnostics_.ensAcceptedSamples;
+        diagnostics_.ensLastAcceptedAt = now;
+        diagnostics_.ensLastRejection = 0;
+        diagnostics_.ensMeasurementUsable = true;
+        diagnostics_.ensAvailabilityReason = "usable";
+      }
+#endif
+    } else if (ensOk_) eco2Valid_ = tvocValid_ = aqiValid_ = false;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+    if (ensOk_ && !ensNewData) {
+      ++diagnostics_.ensRejectedNoNewData;
+      diagnostics_.ensLastRejection = 1;
+      diagnostics_.ensAvailabilityReason = ensUpdate == RESULT_IO_ERROR ? "i2c_error" : "no_new_data";
+    } else if (!ensOk_) {
+      diagnostics_.ensAvailabilityReason = "sensor_unavailable";
+    }
+#endif
+    const bool compensationActive = diagnostics_.ensCompensationActive;
+    if (ensValidity_ != reportedEnsValidity_ || compensationActive != reportedCompensationActive_ ||
+        now - lastEnsStatusSentAt_ >= ReportingConfig::AIR_QUALITY_REFRESH_INTERVAL_MS) {
+      if (reporter.sensorStatus(ensValidity_, compensationActive)) {
+        reportedEnsValidity_ = ensValidity_; reportedCompensationActive_ = compensationActive; lastEnsStatusSentAt_ = now;
+      }
+    }
     reportIfChanged(reporter, now);
   }
   updateImu(now, reporter);
@@ -58,8 +179,8 @@ void SensorManager::reportIfChanged(SensorReporter& reporter, uint32_t now) {
   // to equal the value sent before the failed read.
   if (!temperatureValid_) hasTemperature_ = false;
   if (!pressureValid_) hasPressure_ = false;
-  if (!eco2Valid_) hasEco2_ = false;
-  if (!tvocValid_) hasTvoc_ = false;
+  if (!humidityValid_) hasHumidity_ = false;
+  if (!ahtTemperatureValid_) hasAhtTemperature_ = false;
   const bool environmentRefreshDue = now - lastTemperatureSentAt_ >= ReportingConfig::ENVIRONMENT_REFRESH_INTERVAL_MS;
   const bool pressureRefreshDue = now - lastPressureSentAt_ >= ReportingConfig::ENVIRONMENT_REFRESH_INTERVAL_MS;
   const bool airRefreshDue = now - lastEco2SentAt_ >= ReportingConfig::AIR_QUALITY_REFRESH_INTERVAL_MS;
@@ -78,18 +199,70 @@ void SensorManager::reportIfChanged(SensorReporter& reporter, uint32_t now) {
       ++diagnostics_.updatesTransmitted; if (pressureRefreshDue && !pressureChanged) ++diagnostics_.updatesRefreshed;
     } else ++diagnostics_.transmissionFailures;
   } else if (pressureValid_) ++diagnostics_.updatesSuppressed;
-  if (eco2Valid_ && (!hasEco2_ || airRefreshDue || abs(static_cast<int>(eco2_) - static_cast<int>(reportedEco2_)) >= ReportingConfig::ECO2_DELTA_PPM)) {
+  if (eco2SamplePending_ && (!hasEco2_ || airRefreshDue || abs(static_cast<int>(eco2_) - static_cast<int>(reportedEco2_)) >= ReportingConfig::ECO2_DELTA_PPM)) {
     if (reporter.sensorUpdate("eco2", eco2_, "ppm")) {
       reportedEco2_ = eco2_; lastEco2SentAt_ = now; hasEco2_ = true;
+      eco2SamplePending_ = false;
       ++diagnostics_.updatesTransmitted; if (airRefreshDue) ++diagnostics_.updatesRefreshed;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      ++diagnostics_.ensReportFrames; diagnostics_.ensLastReportAt = now;
+#endif
     } else ++diagnostics_.transmissionFailures;
-  } else if (eco2Valid_) ++diagnostics_.updatesSuppressed;
-  if (tvocValid_ && (!hasTvoc_ || tvocRefreshDue || abs(static_cast<int>(tvoc_) - static_cast<int>(reportedTvoc_)) >= ReportingConfig::TVOC_DELTA_PPB)) {
+  } else if (eco2SamplePending_) ++diagnostics_.updatesSuppressed;
+  if (tvocSamplePending_ && (!hasTvoc_ || tvocRefreshDue || abs(static_cast<int>(tvoc_) - static_cast<int>(reportedTvoc_)) >= ReportingConfig::TVOC_DELTA_PPB)) {
     if (reporter.sensorUpdate("tvoc", tvoc_, "ppb")) {
       reportedTvoc_ = tvoc_; lastTvocSentAt_ = now; hasTvoc_ = true;
+      tvocSamplePending_ = false;
       ++diagnostics_.updatesTransmitted; if (tvocRefreshDue) ++diagnostics_.updatesRefreshed;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      ++diagnostics_.ensReportFrames; diagnostics_.ensLastReportAt = now;
+#endif
     } else ++diagnostics_.transmissionFailures;
-  } else if (tvocValid_) ++diagnostics_.updatesSuppressed;
+  } else if (tvocSamplePending_) ++diagnostics_.updatesSuppressed;
+  const bool aqiRefreshDue = now - lastAqiSentAt_ >= ReportingConfig::AIR_QUALITY_REFRESH_INTERVAL_MS;
+  if (aqiSamplePending_ && (!hasAqi_ || aqiRefreshDue || aqi_ != reportedAqi_)) {
+    if (reporter.sensorUpdate("aqi", aqi_, "index")) {
+      reportedAqi_ = aqi_; lastAqiSentAt_ = now; hasAqi_ = true; ++diagnostics_.updatesTransmitted;
+      aqiSamplePending_ = false;
+#if PHOS_CONTROLLER_DIAGNOSTICS
+      ++diagnostics_.ensReportFrames; diagnostics_.ensLastReportAt = now;
+#endif
+    }
+    else ++diagnostics_.transmissionFailures;
+  }
+  const bool humidityRefreshDue = now - lastHumiditySentAt_ >= ReportingConfig::ENVIRONMENT_REFRESH_INTERVAL_MS;
+  if (humidityValid_ && (!hasHumidity_ || humidityRefreshDue || fabsf(humidity_ - reportedHumidity_) >= .5F)) {
+    if (reporter.sensorUpdate("humidity", humidity_, "%rh")) { reportedHumidity_ = humidity_; lastHumiditySentAt_ = now; hasHumidity_ = true; ++diagnostics_.updatesTransmitted; }
+    else ++diagnostics_.transmissionFailures;
+  }
+  const bool ahtTemperatureRefreshDue = now - lastAhtTemperatureSentAt_ >= ReportingConfig::ENVIRONMENT_REFRESH_INTERVAL_MS;
+  if (ahtTemperatureValid_ && (!hasAhtTemperature_ || ahtTemperatureRefreshDue || fabsf(ahtTemperature_ - reportedAhtTemperature_) >= ReportingConfig::TEMPERATURE_DELTA_C)) {
+    if (reporter.sensorUpdate("aht21_temperature", ahtTemperature_, "c")) { reportedAhtTemperature_ = ahtTemperature_; lastAhtTemperatureSentAt_ = now; hasAhtTemperature_ = true; ++diagnostics_.updatesTransmitted; }
+    else ++diagnostics_.transmissionFailures;
+  }
+}
+
+bool SensorManager::readEnsRegister(uint8_t reg, uint8_t& value) {
+  return ens_ && ens_->read(static_cast<Ens16x_RegisterAddress>(reg), &value, 1) == RESULT_OK;
+}
+
+void SensorManager::readEnsDiagnostics(uint32_t now) {
+#if PHOS_CONTROLLER_DIAGNOSTICS
+  (void)now;
+  if (!ensOk_) return;
+  // update() already read and cached DEVICE_STATUS. Do not issue another
+  // status transaction in diagnostics, so the reference acquisition order is
+  // exactly preserved.
+  const uint8_t rawStatus = ens_->getDeviceStatus();
+  diagnostics_.ensRawStatusRead = true;
+  diagnostics_.ensRawStatus = rawStatus;
+  diagnostics_.ensNewdat = ens_->hasNewData();
+  uint8_t operatingMode = 0;
+  if (readEnsRegister(ENS16X_REGISTER_ADDRESS_OPMODE, operatingMode))
+    diagnostics_.ensOperatingMode = static_cast<int8_t>(operatingMode);
+#else
+  (void)now;
+#endif
 }
 
 void SensorManager::updateImu(uint32_t now, SensorReporter& reporter) {
